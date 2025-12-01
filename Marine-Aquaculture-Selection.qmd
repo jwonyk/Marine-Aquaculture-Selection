@@ -1,0 +1,332 @@
+---
+title: "Marine Aquaculture Suitability Analysis"
+author: "Jay Kim"
+date: "November 30, 2025"
+code-fold: false
+format: html
+execute: 
+  echo: true
+  warning: false
+  message: false
+---
+
+### Set up
+
+We are going to clear the environment and load packages
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+# Clear environment and load required packages
+rm(list = ls())
+pacman::p_load(tidyverse, sf, here, 
+               terra, stars, tmap, units,
+               ggplot2, viridisLite, dplyr, testthat,
+               janitor, knitr, kableExtra, paletteer)
+```
+
+```{r}
+#| label: data-read
+#| message: false
+#| warning: false
+
+# Assign file into lists for average annual sea surface temperature (08-12)
+sst_files <- list.files(here("data"), 
+                      pattern = "average_annual_sst_", 
+                      full.names = TRUE)
+
+# Check to make sure all SST files are loading
+if(length(sst_files) != 5) {
+  
+  stop("Fatal error. Please check the file names or path.")
+  
+} 
+
+# Read in raster objects and shapefile
+eez <- st_read(here("data", "wc_regions_clean", "wc_regions_clean.shp"), 
+               quiet = TRUE)
+depth_rast <- rast(here("data", "depth.tif"))
+sst_rast <- rast(sst_files)
+
+# Check and match CRS
+st_crs(eez)
+crs(depth_rast)
+crs(sst_rast)
+
+# Align EEZ shapefile CRS to SST CRS
+if(!identical(st_crs(eez), st_crs(sst_rast))) {
+  
+  eez <- st_transform(eez, st_crs(sst_rast))
+  
+}
+
+# Match depth raster to SST CRS using `project()`
+if(crs(depth_rast) != crs(sst_rast)) {
+  
+  depth_rast <- project(depth_rast, sst_rast, method = "near")
+  
+}
+```
+
+```{r}
+#| label: average-convert-sst
+#| message: false
+#| warning: false
+
+# Get the average of SST in Kelvin ()
+sst_mean_kelvin <- mean(sst_rast, na.rm = TRUE)
+
+# Convert the average of SST in Celsius
+sst_mean_celsius <- sst_mean_kelvin - 273.15
+
+# Rename the column to make sure no confusion later
+names(sst_mean_celsius) <- "sst_mean_celsius"
+```
+
+```{r}
+#| label: data-crop
+#| message: false
+#| warning: false
+
+# Align depth raster to SST
+depth_crop <- crop(depth_rast, sst_mean_celsius)
+
+# Resample to match SST resolution (use the nearest neighbor)
+depth_resample <- resample(depth_crop, sst_mean_celsius, method = "near")
+
+# Rename the column to make sure no confusion later
+names(depth_resample) <- "depth_resample"
+
+# Check SST and depth are align
+c(sst_mean_celsius, depth_resample)
+compareGeom(sst_mean_celsius, depth_resample)
+```
+
+```{r}
+#| label: oyster-reclassfy
+#| message: false
+#| warning: false
+
+# Oyster thresholds
+oyster_sst_min <- 11
+oyster_sst_max <- 30
+oyster_depth_min <- 0
+oyster_depth_max <- 70
+
+# Reclassify SST suitability
+# 0 = unsuitable & 1 = suitable
+oyster_sst_suitable <- lapp(sst_mean_celsius, 
+                            fun = function(x) {
+                              
+                              ifelse(x >= 11 & x <= 30, 1, 0)
+                              
+                              })
+
+# Reclassify depth
+oyster_depth_suitable <- lapp(depth_resample,
+                              fun = function(x) {
+                                
+                                ifelse(x >= 0 & x <= 70, 1, 0)
+                                
+                                })
+
+# Combine classified SST and depth by multiplying them both
+oyster_cells_suitable <- oyster_sst_suitable * oyster_depth_suitable
+```
+
+```{r}
+#| label: mask-eez
+#| message: false
+#| warning: false
+
+# Convert EEZ object to SpatVector to use as `terra` ojbect
+eez_vector <- vect(eez)
+
+# Crop suitability raster to EEZ bounding box (reduce processing)
+oyster_crop <- crop(oyster_cells_suitable, eez_vector)
+
+# Mask cells outside the EEZ
+oyster_eez <- mask(oyster_crop, eez_vector)
+```
+
+```{r}
+#| label: compute-area
+#| message: false
+#| warning: false
+
+# Compute per-cell area (in km^2)
+cell_area_km2 <- cellSize(oyster_eez, unit = "km")
+
+# Multiply area raster by suitable, 0 vs 1, only return suitable cells
+oyster_area <- oyster_eez * cell_area_km2
+
+# Rename the column to make sure no confusion later
+names(oyster_area) <- "suitable_area_km2"
+```
+
+```{r}
+#| label: rasterize-eez
+#| message: false
+#| warning: false
+
+# Rename ID column to easier access
+eez <- eez %>% 
+  rename(eez_id = rgn_id)
+
+# Convert into SpatVector after name update
+eez_vector <- vect(eez)
+
+# Rasterize EEZ polygons to match raster grid before `zonal()`
+eez_id_raster <- rasterize(eez_vector, oyster_area, field = "eez_id")
+```
+
+```{r}
+#| label: zonal-area
+#| message: false
+#| warning: false
+
+# Add up suitable area within each EEZ zone
+oyster_area_eez <- zonal(oyster_area, eez_id_raster,
+                         fun = "sum",
+                         na.rm = TRUE) %>% 
+  as.data.frame()
+
+# Join with EEZ polygons for mapping purposes
+eez_oyster_join <- eez %>% 
+  left_join(oyster_area_eez, by = "eez_id")
+
+# Create table of suitable area ranked by EEZ
+eez_oyster_join %>% 
+  st_drop_geometry() %>% 
+  arrange(desc(suitable_area_km2)) %>% 
+  kable("html", caption = "Suitable Oyster Habitat Area by EEZ (km^2)") %>% 
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+  
+```
+
+## Oyster Suitable Area
+
+```{r}
+#| label: map-zonal-area
+#| message: false
+#| warning: false
+ 
+# Make sure to initialize "plot" mode for static render
+tmap_mode("plot")
+
+# Extract paleteer colors
+teal_palette <- as.character(paletteer_d("ggsci::teal_material"))
+
+# Map suitable area by EEZ
+tm_shape(eez_oyster_join) + 
+  tm_polygons(col = "suitable_area_km2",
+              palette = colorRampPalette(teal_palette)(20),
+              title = "Sutable Area (km^2)") +
+  tm_layout(main.title = "Oyster Aquaculture Suitability by EEZ",
+            main.title.size = 1, 
+            frame = FALSE,
+            legend.outside = TRUE,
+            legend.outside.position = "right",
+            outer.margins = c(0, 0, 0, 0),
+            inner.margins = c(0, 0, 0, 0.02)) +
+  tm_compass(position = c("right", "top")) +
+  tm_scalebar(position = c("left", "bottom"), text.size = 0.7)
+```
+## Reflection - Oyster Aquaculture Suitability
+
+The oyster aquaculture sustainability analysis demonstrates how combining raster-based environmental data with vector-based EEZ boundaries can show spatial patterns relevant to marine resource planning. By averaging five years of SST data and re-sampling bathymetry, I was able to evaluate habitat suitability with thresholds from the literature. The reclassification and raster algebra workflow made it clear how sensitive spatial outputs are. It needs multiple checking and reassigning to make sure everything can be processed normally. The warmer southern regions has larger areas of meeting oyster depth and temperature requirements than northern parts.
+
+## Workflow Function
+
+```{r}
+#| label: species-function
+#| message: false
+#| warning: false
+
+# General Function to calculate aquaculture suitability
+
+compute_suitability <- function(sst_min, sst_max,
+                                depth_min, depth_max,
+                                species_name) {
+  
+# 1. Reclassify SST
+sst_suitable <- lapp(sst_mean_celsius,
+fun = function(x) ifelse(x >= sst_min & x <= sst_max, 1, 0))
+
+# 2. Reclassify Depth
+depth_suitable <- lapp(depth_resample,
+fun = function(x) ifelse(x >= depth_min & x <= depth_max, 1, 0))
+
+# 3. Combine Suitability
+suit_cells <- sst_suitable * depth_suitable
+
+# 4. Crop and Mask to EEZ
+suit_crop <- crop(suit_cells, eez_vector)
+suit_eez <- mask(suit_crop, eez_vector)
+
+# 5. Convert Suitability to Area in km^2
+cell_area <- cellSize(suit_eez, unit = "km")
+suit_area <- suit_eez * cell_area
+names(suit_area) <- "suitable_area_km2"
+
+# 6. Rasterize EEZ and Compute Zonal Area
+eez_id_raster <- rasterize(eez_vector, suit_area, field = "eez_id")
+
+zone_df <- zonal(suit_area, eez_id_raster,
+fun = "sum", na.rm = TRUE) %>% 
+as.data.frame()
+
+# 7. Join results
+eez_join <- eez %>% 
+  left_join(zone_df, by = "eez_id")
+
+# 8. Map
+
+teal_palette <- as.character(paletteer::paletteer_d("ggsci::teal_material"))
+
+map <- tm_shape(eez_join) +
+  tm_polygons(col = "suitable_area_km2",
+              palette = colorRampPalette(teal_palette)(20),
+              title = "Suitable Area (km²)") +
+  tm_layout(main.title = paste("Aquaculture Suitability for", species_name),
+            main.title.size = 1.0,
+            legend.outside = TRUE,
+            frame = FALSE) +
+  tm_compass(position = c("right", "top")) +
+  tm_scalebar(position = c("left", "bottom"), text.size = 0.7)
+
+return(map)}
+```
+
+```{r}
+#| label: mussel-results
+#| message: false
+#| warning: false
+
+# SST 9 to 18 degrees Celsius, depth 0 to 20 meters
+mussle_map <- compute_suitability(
+  sst_min = 9,
+  sst_max = 18,
+  depth_min = 0,
+  depth_max = 20,
+  species_name = "Mussels (A. californiensis)")
+
+mussle_map
+```
+## Reflection - Mussel Aquaculture Suitability
+
+The mussel suitability assessment shows different spatial patterns compare to oysters, emphasizing how species-specific environmental requirements could lead to different aquaculture potential across EEZs. Mussels favor cooler temperature and shallow depths and shows that more suitable northward than southern regions.  
+
+## README
+
+```{r}
+#| label: readme-screenshot
+#| message: false
+#| warning: false
+#| echo: false
+
+knitr::include_graphics(here("output", "readme.png"))
+```
+
